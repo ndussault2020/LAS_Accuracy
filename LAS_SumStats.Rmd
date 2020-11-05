@@ -1,0 +1,144 @@
+---
+title: "LAS Analysis Summary Statistics"
+output:
+    html_notebook:
+      toc: yes
+      toc_depth: 2
+      toc_float: yes
+
+---
+
+
+  PROJECT:    	Accuracy of of LAS
+  
+  PROGRAMMER: 	Nicole Dussault, Will Parker
+  
+  PROGNAME:   	Analysis
+  
+  CREATED:    	Fall 2019
+  
+  LAST UPDATED: "`r format(Sys.time(), '%d %B, %Y')`"
+  
+  OBJECTIVE: 	  Summary statistics for the Accuracy of of LAS project
+  
+  NOTES: 
+  
+
+```{r Load_libraries, include = FALSE}
+
+rm(list=ls())
+library(tidyverse)
+library(tableone)
+library(haven)
+
+
+
+```
+
+
+```{r Convenience_functions, include = FALSE}
+
+#Convenience functions
+
+numextract <- function(string){
+  as.numeric(str_extract(string, "\\-*\\d+\\.*\\d*"))
+}
+
+comma <- function(x) format(x, digits = 3, big.mark = ",")
+
+comma_0 <- function(x) format(x, digits = 0, big.mark = ",")
+
+
+comma_1 <- function(x) format(x, digits = 1, big.mark = ",")
+
+comma_2 <- function(x) format(x, digits = 2, big.mark = ",")
+
+comma_p <- function(x){
+  if (x < 0.001){
+    return("< 0.001")
+  }
+  if (x<0.01 & x>=0.001){
+    paste("=", format(x, digits = 3, big.mark = ","))
+  }
+  else{
+    paste("=", format(x, digits = 2, big.mark = ","))
+  }
+} 
+
+```
+
+
+```{r Load_data, message=FALSE, include = FALSE}
+
+#Import data
+
+working_samp_WL <- read.csv("./Data/Waitlist.csv")                            #Waitlist candidates dataset
+working_samp_PT <- read.csv("./Data/Posttransplant.csv")                      #Transplant recipients dataset
+
+wait_surv <- read_csv("./Data/wait_list_baseline_survival.csv")%>%            #LAS waitlist baseline survival
+  rename(time = Time)                                                         #For variable name consistency 
+post_surv <- read_csv("./Data/post_transplant_baseline_survival.csv") %>%     #LAS post-transplant baseline survival
+  rename(time = Time)                                                         #For variable name consistency
+
+
+las_scores <- read_sas("./Data/las_scores_1809saf.sas7bdat", NULL) %>%        #Actual LAS scores from SRTR
+  zap_formats() %>% zap_labels()
+
+
+
+
+
+```
+
+
+#Table  - Summary Statistics, comparing all waitlist candidates vs all transplant recipients
+```{r Table_one_all, echo=FALSE, message= FALSE, error= FALSE, warning=FALSE}
+
+#Recategorize continuous mechanical ventilation and functional status as binary variables, to relect how they are used in the LAS equation
+working_samp_WL <- working_samp_WL %>% mutate(cont_mv = ifelse(CANHX_CALC_VENTILATOR_USE == 2, 1, 0),
+                                              func_stat = ifelse(CANHX_FUNCTN_STAT == 1, 1, 0),
+                                              age = CAN_AGE_AT_LISTING,
+                                              cr_rise = 0)
+
+#Recategorize continuous mechanical ventilation and functional status as binary variables, to reflect how they are used in the LAS equation
+working_samp_PT <- working_samp_PT %>% mutate(cont_mv = ifelse(CANHX_CALC_VENTILATOR_USE == 2, 1, 0),
+                                              func_stat = ifelse(CANHX_FUNCTN_STAT == 1, 1, 0),
+                                              age = REC_AGE_AT_TX) 
+
+#Variables for table
+myVars <- c("age", "creatinine", "cr_rise", "CANHX_CALC_BMI", "CANHX_CI", "CANHX_CVP_INT", 
+               "cont_mv", "group", "CANHX_PAP_MEAN", 
+               "CANHX_CALC_FVC_PREDICTED", "func_stat", "CANHX_CALC_O2_AMT", 
+               "CANHX_CALC_PCO2", "CANHX_PCO2_THRESHOLD_CHG", "CANHX_CALC_PAP_SYST", 
+               "CANHX_CALC_SIX_MIN_WALK")
+
+#categorical variables
+catVars <- c("cr_rise","cont_mv", "group", "func_stat", "CANHX_PCO2_THRESHOLD_CHG")
+
+
+
+
+#First combine candidates and recipients into a single dataframe
+for_tab <- working_samp_WL %>% 
+  mutate(mygroup = "Candidates") %>% 
+  select(myVars, mygroup) %>%
+  rbind(working_samp_PT %>% 
+          mutate( mygroup = "Recipients") %>% 
+          select(myVars, mygroup))
+
+#Create table
+tab <- CreateTableOne(vars = myVars, data = for_tab, factorVars = catVars, strata = "mygroup")
+
+#Print table with quoting to enable easy paste into excel
+print(tab, quote = TRUE)
+
+
+
+```
+
+
+
+
+
+
+

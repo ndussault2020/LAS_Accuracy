@@ -1,0 +1,482 @@
+---
+title: "Post Transplant Data Clean"
+output:
+    html_notebook:
+      toc: yes
+      toc_depth: 2
+      toc_float: yes
+
+---
+ 
+  PROJECT:    	Accuracy of of LAS
+  
+  PROGRAMMER: 	Nicole Dussault, Will Parker
+  
+  PROGNAME:   	Post_Transplant_Data_Clean
+  
+  CREATED:    	7/5/2019
+  
+  LAST UPDATED: "`r format(Sys.time(), '%d %B, %Y')`"
+  
+  OBJECTIVE: 	  Create Post-transplant dataset for LAS accuracy analysis   
+  
+  NOTES:        Updated for Feb 2015 - Feb 2019
+  
+
+
+```{r Load_libraries, include = FALSE}
+
+rm(list=ls())
+library(tidyverse)
+library(haven)
+library(lubridate)
+library(survival)
+library(ggfortify)
+
+```
+
+
+```{r Convenience_functions, include = FALSE}
+
+#Convenience functions
+
+numextract <- function(string){
+  as.numeric(str_extract(string, "\\-*\\d+\\.*\\d*"))
+}
+
+comma <- function(x) format(x, digits = 3, big.mark = ",")
+
+comma_0 <- function(x) format(x, digits = 0, big.mark = ",")
+
+
+comma_1 <- function(x) format(x, digits = 1, big.mark = ",")
+
+comma_2 <- function(x) format(x, digits = 2, big.mark = ",")
+
+comma_p <- function(x){
+  if (x < 0.001){
+    return("< 0.001")
+  }
+  if (x<0.01 & x>=0.001){
+    paste("=", format(x, digits = 3, big.mark = ","))
+  }
+  else{
+    paste("=", format(x, digits = 2, big.mark = ","))
+  }
+} 
+
+```
+
+
+#Prepare data
+Baseline survival function taken from OPTN policy tables 10-11 & 10-12, pgs. 203-206.  These were taken, imported into an excel and convert to a .csv file for importation into R.  
+
+##Import data
+```{r Load_data, message=FALSE}
+
+
+#Load LAS data
+lu_alloc <- read_csv("./Data/lu_alloc.csv")                                  
+
+#Load candidate data
+cand_thor <- read_sas("./Data/cand_thor.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+#Load recipient data
+tx_lu <- read_sas("./Data/tx_lu.sas7bdat", NULL) %>%  
+  zap_formats() %>% zap_labels()
+
+#Load diagnosis codes
+lu_dx_codes <-read_csv("./Data/Lung Diagnosis.csv") %>% 
+  select(group = GROUP, code = CD) %>%
+  mutate(group = ifelse((code == 1605), "A", group))                          #Set 1605 as code A for now, will adjust further down
+
+#Load post-transplant baseline survival function
+post_surv <- read_csv("./Data/post_transplant_baseline_survival.csv") %>%
+  rename(time = Time)                                                         #for variable name consistency 
+
+
+```
+
+##Select the LAS variables for each patient at the time of transplant
+```{r LAS_variables, echo = TRUE, message = FALSE, error=FALSE}
+
+#Find the LAS variables at the time of transplant 
+LAS_vars_PT <- lu_alloc %>%
+  group_by(PX_ID, CANHX_CHG_DT) %>%
+  filter(row_number() == n()) %>%                                             #select the last record for a given day
+  group_by(PX_ID) %>%  
+  arrange(PX_ID, CANHX_CHG_DT) %>%
+  mutate(
+    CANHX_CALC_VENTILATOR_USE = ifelse(CANHX_CALC_VENTILATOR_USE == 6 | 
+                                         CANHX_CALC_VENTILATOR_USE == 7,
+                                       2, CANHX_CALC_VENTILATOR_USE),         #MV coded as 2, 6, and 7 depending on year -> merge
+    #fill in creatinine data
+    creatinine = ifelse(is.na(CANHX_CALC_SERUM_CREAT), 
+                        CANHX_SERUM_CREAT, CANHX_CALC_SERUM_CREAT),           #Fill in with existing LAS data
+    max_cr = max(creatinine),                                                 #Estimate rise in creatine
+    min_cr = min(creatinine),
+    cr_rise = case_when(
+      ((max_cr-min_cr)/(min_cr) > 1.5) & max_cr >1  ~ 1,
+      TRUE ~ 0 ) )  %>%
+   #select the last record for each candidate - this is the one closest to their transplant, if they had a transplant
+  slice(n()) %>%   
+  ungroup()
+
+```
+
+
+##Set timeframe and relevant sample
+```{r Date_range}
+
+#time frame
+start_date <- as.Date("02/19/2015", "%m/%d/%Y")
+
+end_date <- as.Date("02/19/2019", "%m/%d/%Y")
+#sample
+organ <- "LU"
+peds <- TRUE
+
+```
+
+
+##Clean data - create working sample
+```{r Clean_data, echo = TRUE, message = FALSE, error=FALSE}
+
+#Merge data
+working_samp_PT <- tx_lu %>% 
+  select(-starts_with("DON_")) %>%                                       #drop Donor variables to make the dataset more manageable
+  left_join(cand_thor %>% 
+              select(PX_ID, CAN_ECMO, CAN_REM_DT, 
+                     CAN_DEATH_DT, CAN_AGE_AT_LISTING)) %>%              #Merge with select candidate data
+  left_join(LAS_vars_PT %>%select(PX_ID, everything())) %>%              #Merge with LAS variables
+  mutate(code = as.numeric(CAN_DGN_LU),
+         year = year(REC_TX_DT),
+         ECMO = REC_ECMO,
+         creatinine = ifelse(is.na(creatinine), 
+                             REC_CREAT, creatinine ) ) %>%               #If still issing creatinine, use recipient data
+  left_join(lu_dx_codes, by = "code") %>%                                #merge with lung codes
+  mutate(
+    group = as.character(group),
+    group = ifelse((code == 1605 & CANHX_CALC_PAP_MEAN >30), 
+                   "D", group))                                          #reassign sarcoid patients to group D if PA pressure > 30
+
+
+#Filter data and Collect sample sizes for flow chart
+print(c("all data", nrow(working_samp_PT)))
+
+working_samp_PT <- working_samp_PT %>%
+  filter(REC_TX_DT > start_date & REC_TX_DT <= end_date)              #filter to dates
+
+print(c("exclude out of year", nrow(working_samp_PT)))
+
+working_samp_PT <- working_samp_PT %>%  
+  filter(ORG_TY == organ)                                                #filter to lung transplant   
+print(c("exclude non-lung TX", nrow(working_samp_PT)))
+
+working_samp_PT <- working_samp_PT %>% 
+  filter(CAN_AGE_AT_LISTING >=12)	                                       #filter to recipients listed > 12 years
+print(c("exclude >=12", nrow(working_samp_PT)))  
+
+
+
+#Create one death variable
+working_samp_PT <- working_samp_PT %>% 
+   mutate(death_dt = as.Date(pmax(PERS_SSA_DEATH_DT, PERS_OPTN_DEATH_DT, 
+                                  PERS_RESTRICT_DEATH_DT, TFL_DEATH_DT, 
+                                  na.rm = TRUE )))  
+
+
+#remove pediatric candidates if indicated
+if (peds == FALSE){
+	working_samp_PT <- working_samp_PT %>% filter(REC_AGE_AT_TX >17)	
+}
+
+
+initial_sample_size_PT <- nrow(working_samp_PT)
+
+
+```
+The initial sample size is `r initial_sample_size_PT`
+
+
+#Explore Data - to check for data quality
+
+```{r}
+working_samp_PT %>%
+  group_by(year(REC_TX_DT)) %>%
+  count()
+```
+
+
+```{r Explore_data_means}
+
+#Find the mean value of each variable used in the post_xb calculation, by transplant year
+working_samp_PT %>%
+  group_by(year(REC_TX_DT)) %>%
+  summarise(REC_AGE_AT_TX = mean(REC_AGE_AT_TX),
+            creatinine = mean(creatinine, na.rm=TRUE),
+            cr_rise = mean(cr_rise, na.rm = TRUE),
+            CANHX_CI = mean(CANHX_CI, na.rm = TRUE),
+            CANHX_CALC_VENTILATOR_USE = mean(CANHX_CALC_VENTILATOR_USE, na.rm = TRUE),
+            CANHX_CALC_O2_AMT = mean(CANHX_CALC_O2_AMT, na.rm=TRUE),
+            CANHX_FUNCTN_STAT = mean(CANHX_FUNCTN_STAT, na.rm=TRUE),
+            CANHX_CALC_SIX_MIN_WALK = mean(CANHX_CALC_SIX_MIN_WALK, na.rm=TRUE)
+        )
+
+```
+
+```{r Explore_data_miss}
+
+#Find the percent of individuals missing values for each post_xb variable, by transplant year
+working_samp_PT %>%
+  group_by(year(REC_TX_DT)) %>%
+  summarise(miss_AGE = mean(is.na(REC_AGE_AT_TX)),
+            creatinine = mean(is.na(creatinine)),
+            miss_cr_rise = mean(is.na(cr_rise)),
+            miss_CI = mean(is.na(CANHX_CI)),
+            miss_VENT = mean(is.na(CANHX_CALC_VENTILATOR_USE)),
+            miss_O2 = mean(is.na(CANHX_CALC_O2_AMT)),
+            miss_FUNCTN = mean(is.na(CANHX_FUNCTN_STAT)),
+            miss_SIX = mean(is.na(CANHX_CALC_SIX_MIN_WALK))
+  )
+
+```
+
+
+#Post-transplant Xbeta calculation
+
+"If values for certain covariates are missing, expired, or below the threshold as defined by Table 10- 1, then the LAS calculation will substitute normal or least beneficial values to calculate the candidate's LAS. A normal value is one that a healthy individual is likely to exhibit. A least beneficial value is one that will calculate the lowest LAS for a candidate. Table 10-1 lists the normal and least beneficial values that will be substituted."
+
+below is the code that sums the appropriate waitlist xbeta coefficents.  The coefficents are the 16 digit coefficents used in the OPTN_policy.pdf https://optn.transplant.hrsa.gov/media/1200/optn_policies.pdf.
+
+```{r Sum_of_post_x_betas}
+
+working_samp_PT <- working_samp_PT %>% mutate(
+  post_xb = 
+    case_when(
+      REC_AGE_AT_TX < 46 ~ 0,         
+      TRUE ~ 0.0246579831271869*(REC_AGE_AT_TX - 45.9972602)) +      
+    case_when(
+      is.na(creatinine) & REC_AGE_AT_TX >= 18 ~ 0.0895569900508900*40,   
+      REC_AGE_AT_TX >= 18 ~ 0.0895569900508900*creatinine,
+      TRUE ~ 0) +
+    case_when(
+      cr_rise == 1 ~ 0.7708616024698100,
+      TRUE ~ 0) +
+    case_when(
+      CANHX_CI < 2 ~ 0.3499381679822400,
+      TRUE ~ 0) +
+    case_when(
+      ECMO == 1 ~ 0.6094478988424900,
+      CANHX_CALC_VENTILATOR_USE == 2 | is.na(CANHX_CALC_VENTILATOR_USE) ~ 0.6094478988424900,   
+      TRUE ~ 0) + 
+    case_when(
+      group == "A" ~ 0,
+      group == "B" ~ 0.6115547319209300,
+      group == "C" ~ 0.3627014422464200,
+      group == "D" ~ 0.4641392063023200) +
+    case_when(
+      #bronchectasis
+      group == "A" & code == 1608 ~ 0.1889100379099400,
+      #eisenmonger
+      group == "B" & code %in% c(1500, 1548, 1549, 1502, 1501) ~ 0.9146727886744700,
+      #LAM
+      group == "A" & code == 1611 ~ -1.5194416206749400,
+      #OB (no re-tx)
+      group == "D" & code == 1612 ~ -1.2050508750702600,
+      #pulmonary fibrosis, not IPF
+      group == "D" & code == 1613 ~ -0.0723596761367600,
+      #sarcoid w/ ph qualifiers
+      group == "D" & code == 1605 & CANHX_CALC_PAP_MEAN > 30 ~ -0.0437880049066331,
+      group == "A" & code == 1605 & CANHX_CALC_PAP_MEAN <= 30 ~ -0.1389363636019300,
+      group == "A" & code == 1605 & is.na(CANHX_CALC_PAP_MEAN) ~ -0.1389363636019300,   
+      TRUE ~ 0)+
+    case_when(
+      ECMO == 1 & group == "A" ~ 26.33*0.0747978926517300,
+      ECMO == 1 ~ 26.33* 0.0164276945879309,
+      is.na(CANHX_CALC_O2_AMT) & group == "A" ~ 26.33*0.0747978926517300,
+      group == "A" ~ CANHX_CALC_O2_AMT*0.0747978926517300,     
+      is.na(CANHX_CALC_O2_AMT) ~ 26.33*0.0164276945879309,
+      TRUE ~ CANHX_CALC_O2_AMT*0.0164276945879309) +
+    case_when(
+      CANHX_FUNCTN_STAT == 1 ~ -0.1900086366785100,
+      TRUE ~ 0) +
+    case_when(
+      CANHX_CALC_SIX_MIN_WALK > 1200 ~ 0,
+      !is.na(CANHX_CALC_SIX_MIN_WALK) ~ 0.0004594953809594*(1200-CANHX_CALC_SIX_MIN_WALK),  
+      TRUE ~ 0.0004594953809594*(1200-0))
+  )
+
+#Find how many missing post xb
+missing_xb_PT <- working_samp_PT %>%
+  filter(is.na(post_xb)) %>%
+  nrow()
+
+#Remove those missing post xb
+working_samp_PT<- working_samp_PT %>%
+  filter(!is.na(post_xb))         
+
+print(c("after remove missing post xbeta", nrow(working_samp_PT)))
+
+
+```
+
+
+```{r Histogram_xb}
+
+hist(working_samp_PT$post_xb) 
+
+```
+
+
+
+# Waitlist Xbeta calculation
+
+"If values for certain covariates are missing, expired, or below the threshold as defined by Table 10- 1, then the LAS calculation will substitute normal or least beneficial values to calculate the candidate's LAS. A normal value is one that a healthy individual is likely to exhibit. A least beneficial value is one that will calculate the lowest LAS for a candidate. Table 10-1 lists the normal and least beneficial values that will be substituted."
+
+below is the code that sums the appropriate waitlist xbeta coefficents.  The coefficents are the 16 digit coefficents used in the OPTN_policy.pdf https://optn.transplant.hrsa.gov/media/1200/optn_policies.pdf. 
+
+```{r Sum_of_wait_x_betas}
+
+working_samp_PT <- working_samp_PT %>% mutate(
+   wait_xb = 
+   0.0083990318885565*REC_AGE_AT_TX +                                        #Though this is WL_xb, use current age (ie age at tx)
+    case_when(
+      CANHX_CALC_BMI < 20 ~ 0.1261444133358100*(20 - CANHX_CALC_BMI),
+      TRUE ~ 0)+
+    case_when(
+      CANHX_CI < 2 ~ 0.5435368888028200,
+      TRUE ~ 0)+
+    case_when(
+      group == "B" & CANHX_CVP_INT > 7 ~ 0.0173841981251578*(CANHX_CVP_INT - 7),
+      TRUE ~ 0) +
+    case_when( 
+      ECMO == 1 ~ 1.6771121096052300, 
+      CANHX_CALC_VENTILATOR_USE == 2 ~ 1.6771121096052300,
+      TRUE ~ 0) +
+    case_when(
+       REC_AGE_AT_TX  >= 18 & !is.na(creatinine) ~ 0.5034346761960600*creatinine,
+       REC_AGE_AT_TX >= 18 ~ 0.5034346761960600*(0.1),
+       TRUE ~ 0) +
+    case_when(
+      CANHX_CALC_DIAB %in% c("I", "N") ~ 0.4680254026735700,
+      TRUE ~ 0) + 
+   case_when(
+      group == "A" ~ 0,
+      group == "B" ~ 1.5774243292137200,
+      group == "C" ~ 1.2313926484343600,
+      group == "D" ~ 0.6259577164157700) +
+    case_when(
+      #bronchectasis
+      group == "A" & code == 1608 ~ 0.6680518055684700,
+      #eisenmonger
+      group == "B" & code %in% c(1500, 1548, 1549, 1502, 1501) ~ -0.6278657824830000,
+      #LAM
+      group == "A" & code == 1611 ~ -0.3162937838984600,
+      #OB (no re-tx)
+      group == "D" & code == 1612 ~ 0.4453284411081100,
+      #pulmonary fibrosis, not IPF 
+      group == "D" & code == 1613 ~ -0.2091170018125500,
+      #sarcoid
+      group == "D" & code == 1605 & CANHX_PAP_MEAN > 30 ~ -0.4577749354638600,
+      group == "A" & code == 1605 & CANHX_PAP_MEAN <= 30 ~ 0.9330846239906700,
+      TRUE ~ 0) +
+    case_when(
+     group == "D" & CANHX_CALC_FVC_PREDICTED < 80 ~ 0.1829476350587400*(80-CANHX_CALC_FVC_PREDICTED)/10,
+      TRUE ~ 0) + 
+    case_when(
+      CANHX_FUNCTN_STAT == 1 ~ -0.4471034284458400,
+      is.na(CANHX_FUNCTN_STAT) ~  -0.4471034284458400,
+      TRUE ~ 0)+
+     case_when(
+       ECMO == 1 & group == "B" ~  0.0213187586203456*26.33,
+       ECMO == 1 ~  0.1188479817592500*26.33,
+       is.na(CANHX_CALC_O2_AMT) ~ 0,
+       group == "B" ~ 0.0213187586203456*CANHX_CALC_O2_AMT,
+       TRUE ~ 0.1188479817592500*CANHX_CALC_O2_AMT) +
+    case_when(
+      is.na(CANHX_CALC_PCO2) | CANHX_CALC_PCO2 < 40 ~ 0.1104609835819100*(40/10),
+      CANHX_CALC_PCO2 >= 40 ~ 0.1104609835819100*(CANHX_CALC_PCO2/10),
+      TRUE ~ 0) +
+    case_when(
+      CANHX_PCO2_THRESHOLD_CHG == 1 ~ 0.2331149280428300,
+      TRUE ~ 0) +
+    case_when(
+      CANHX_CALC_PAP_SYST > 40 & group == "A" ~ 0.4155116686114300*(CANHX_CALC_PAP_SYST -40)/10,
+      group == "A" ~ 0,
+      CANHX_CALC_PAP_SYST < 20 | is.na(CANHX_CALC_PAP_SYST) ~ 0.0462410402627318*(20)/10,
+      TRUE ~ 0.0462410402627318*(CANHX_CALC_PAP_SYST)/10) +
+    case_when( 
+      !is.na(CANHX_CALC_SIX_MIN_WALK)  ~ -0.0844896372724000*CANHX_CALC_SIX_MIN_WALK/100,
+      TRUE ~ -0.0844896372724000*(4000)/100
+      )
+)
+
+#Find how many missing wait xb
+missing_wxb_PT <- working_samp_PT %>%
+  filter(is.na(wait_xb)) %>%
+  nrow()
+
+#Remove those missing wait xb
+working_samp_PT <- working_samp_PT %>%
+  filter(!is.na(wait_xb))         
+
+print(c("after remove missing wait xbeta", nrow(working_samp_PT)))
+
+
+```
+
+
+#Create death and censor variables for observed survival analysis
+
+Per the original LAS paper (Egan 2006 AJT)
+
+>**Post transplant mortality**
+To examine the impact of candidate characteristics on posttransplant mortality within 1 year, a multivariable logistic regression analysis was performed. For patients with known status at 1 year (alive or dead), a weight of 1 was used. For patients reported as alive but with incomplete followup at 1 year, a weight was used that corresponded to the proportion of the 365-day interval for which the patient's status was known. All factors collected on the OPTN TCR and Transplant Recipient Registration forms that were not considered manipulable and were deemed appropriate for the use in an allocation system were considered as potential predictors for posttransplant mortality. This included a wide variety of demographic, clinical, hemodynamic, and pulmonary function factors. The cohort for this analysis included all deceased donor lung-only transplants performed between January 1, 1996 and June 30, 1999, with COPD (n = 1422), CF (n = 498), IPF (n = 463) or PPH (n = 146). There were no exclusions for recipient age or previous transplant.
+
+```{r Create_time_variables}
+
+working_samp_PT<- working_samp_PT %>% 
+  filter(!is.na(TFL_LAFUDATE) & !is.na(REC_TX_DT)) %>%        #removing recipients without valid folow-up or tx dates
+  mutate(
+  censor_range = TFL_LAFUDATE - REC_TX_DT,                    #Number of days patient in sample after their tx
+  death_range = death_dt - REC_TX_DT,                         #Number of days patient in sample from tx to death
+  death1yr = case_when(                                       #Death within 1 year if die within one year of tx
+    TFL_LASTATUS == "D" & death_range <= 364  ~ 1, 
+    TRUE ~ 0),     
+  time = as.numeric(case_when(                                #Number of days patient is in the sample, whether death or censor, bound at 364
+    death1yr == 1 ~ death_range,
+    censor_range <= 364 ~ censor_range,
+    TRUE ~ 364))                                              #note: day 1 is coded as 0
+  ) %>%
+  filter(time >= 0)
+ 
+ 
+print(c("after remove time inconsistencies", nrow(working_samp_PT)))
+
+```
+
+
+
+
+```{r Plot_distribution_failure_times, message = FALSE, warning = FALSE}
+
+#Failure time distribution (censored at one year)
+ggplot(working_samp_PT) +
+  geom_histogram(aes(x = time))
+
+```
+
+
+
+
+#Export data
+```{r Export}
+
+write_csv(working_samp_PT, path = "./Data/Posttransplant.csv")
+
+
+```
+
+

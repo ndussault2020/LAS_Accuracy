@@ -1,0 +1,936 @@
+---
+title: "Accuracy of of LAS - Analysis - sensitivity boostrap 1000 samples"
+author: Will Parker, Nicole Dussault
+output:
+    html_notebook:
+      toc: yes
+      toc_depth: 2
+      toc_float: yes
+---
+
+```{r Load_libraries, cache=FALSE}
+library(knitr)
+library(tidyverse)
+library(survival)
+library(survAUC)
+library(haven)
+library(ggfortify)
+library(cowplot)
+library(gridExtra)
+library(grid)
+library(ggplotify)
+```
+
+
+# Data prep
+
+##Graphing function
+```{r Combined_plot2_function, include = FALSE, echo=FALSE, message=FALSE, error=FALSE}
+
+#Function to arrange the 2 plots into a single figure
+
+combined_plot2 <- function(plot1, plot2, Title){
+
+mylegend <- cowplot::get_legend(plot1)
+
+combined_match <- grid.arrange(
+  arrangeGrob(plot1 + theme(legend.position="none"),
+              plot2 + theme(legend.position="none",
+                               axis.title.y = element_blank(),
+                               axis.text.y = element_blank()),
+              nrow=1, widths = c(0.75, 0.7)),
+  mylegend,
+  heights=c(10, 1),
+  top = grid::textGrob(Title, gp=grid::gpar(fontsize=12,font=1,fontfamily = "serif"), 
+                       x = 0, hjust = 0)
+  )
+
+}
+
+```
+
+
+## Load in data
+```{r Load_data, message=FALSE}
+
+#Import data
+
+#Waitlist candidates dataset
+candidates <- read.csv("./Data/Waitlist.csv")  %>% 
+  select(post_xb, wait_xb, time, death1yr, PX_ID)
+
+
+#Transplant recipients dataset
+recips <- read.csv("./Data/Posttransplant.csv")   %>%
+  select(post_xb, wait_xb, time, death1yr)
+
+
+#LAS waitlist baseline survival
+wait_surv <- read_csv("./Data/wait_list_baseline_survival.csv")%>%            
+  rename(time = Time)                                                        
+
+#LAS post-transplant baseline survival
+post_surv <- read_csv("./Data/post_transplant_baseline_survival.csv") %>%     
+  rename(time = Time)         
+
+
+```
+
+
+## Compute WL, PT, and LAS for recipient and candidate cohorts
+```{r }
+# function to compute rmst
+rmst <- function(xb, baseline_surv){
+  
+  df <- baseline_surv %>%
+    filter(time != 0) %>%
+    mutate(pt_surv = Survival^(exp(xb)),
+           time_diff = ifelse(row_number() == 1, time, time - lag(time)),
+           days = pt_surv*time_diff)
+  
+  
+  return(sum(df$days))
+}
+
+#Function to compute LAS
+LAS <- function(PT, WL){
+  (100*(PT - 2*WL + 730))/1095
+}
+
+#Calculate PT and WL for each transplant recipient, at time of transplant
+PT_recips <- map_dbl(recips$post_xb, rmst, baseline_surv = post_surv)
+WL_recips <- map_dbl(recips$wait_xb, rmst, baseline_surv = wait_surv)
+
+#Calculate LAS at time of transplant for each transplant recipient
+recips <- recips %>%
+  cbind(PT = PT_recips, WL = WL_recips) %>%
+  mutate(LAS = LAS(PT, WL))
+
+#Calculate PT and WL for each waitlist candidate, at time of listing
+PT_cands <- map_dbl(candidates$post_xb, rmst, baseline_surv = post_surv)
+WL_cands <- map_dbl(candidates$wait_xb, rmst, baseline_surv = wait_surv)
+
+#Calculate LAS at time of listing for each waitlist candidate
+candidates <- candidates %>%
+  cbind(PT = PT_cands, WL = WL_cands) %>%
+  mutate(LAS = LAS(PT, WL))
+```
+
+## Generate bootstrap samples
+```{r }
+set.seed(123564)
+sim_number <- 1000
+recip_sample_list <- map(1:sim_number, sample_n, tbl = recips,  size = nrow(recips))
+can_sample_list <- map(1:sim_number, sample_n, tbl = candidates,  size = nrow(candidates))
+```
+
+
+
+# The Problem of LAS Discrimination
+
+The [Lung Allocation Score (LAS)](https://optn.transplant.hrsa.gov/media/1200/optn_policies.pdf) is a composite score that is computed from a candidates $PT$ and $WL$ scores, which are [restricted mean survival time (RMST)](https://bmcmedresmethodol.biomedcentral.com/articles/10.1186/1471-2288-13-152) predictions from two cox proportional hazard models. 
+
+
+$$LAS = 100*\frac{(PT - 2WL + 730)}{1095}$$
+
+It is relatively straighforward to evaluate the **calibration** of the $PT$ and $WL$ models, as the model predicted RMST can be compared to a non-parametric RMST calculated from a Kaplan-meier estimator. This can be extended to an estimate of the calibration of the overall LAS by combining the waitlist and recipient errors.
+
+However, evaluating the **discrimination** of LAS, defined as the "success" of the rank ordering of candidates and recipients by LAS) is more desirable from an allocation perspective. This task is complex for two reasons:
+
+1. Picking the best approach to evaluating discrimination of the wait list model, i.e. survival time prediction model with significant right-censoring in the interval of interest
+2. Assuming a satisfactory solution to problem 1 is found, it is unclear how to combine the two discrimination measures into an "LAS discrimination"
+
+
+I believe the solution to task 1 above is to use the [concordance probability estimate ](https://www.mskcc.org/sites/default/files/node/2246/documents/cpe.pdf) instead of harrel's c-index. The solution to task 2 is unclear.
+
+## Aside on the outcome: Restricted mean survival time (the area under the Kaplan-Meier Curve) 
+
+The RMST can be conceptualized as the average amount a time a patient would survive within a given interval (typically from $t =0$ to some cutoff $t = \tau$). So using the example of survival on the waitlist used for LAS, the RMST is the average number of days survived on the waitlist when we follow them for a year. 
+
+### RMST with time cutoff $\tau = 365$
+```{r rmst_example, echo = FALSE}
+cand_km_example <- survfit(Surv(time, death1yr)~1, candidates)
+
+tibble(time = cand_km_example$time,
+       surv = cand_km_example$surv) %>%
+  ggplot(aes(x = time, y = surv)) +
+    geom_step(aes(linetype = "KM Survival estimate")) + lims(y = c(0,1)) +
+  geom_ribbon(aes(ymax = surv, ymin = 0, fill= "RMST"), alpha = 0.5) +
+  labs(fill = "", linetype = "")
+```
+
+Mathematically the RMST is represented as
+
+$$RMST = \int_0^{\tau} \hat{S}(t) dt$$
+
+In the case of an RMST computed from a KM estimate, this reduces to the sum of rectangles:
+
+$$RMST_{KM} = \sum_{t_i = 1}^{t_i= \tau} (t_i - t_{i-1})*\hat{S}(t_{i-1})$$
+
+So the RMST has bounds $[0, \tau]$.
+
+### Rank ordering of the linear predictions is what is needed for discrimination
+
+It's important to note that RMST is a **strictly decreasing** function of the linear prediction from the WL cox model. Formally, it holds that if for any patients $i$ and $j$
+
+$$X_i'\beta_{WL} > X_j'\beta_{WL} \iff WL_i < WL_j  $$
+
+As such, discrimination with respect to the linear predictor $X'\beta$ is sufficient for evaluating the discrimination of either the waitlist or post-transplant model 
+
+
+## Discrimination of PT and WL models
+
+### Harrel's c-index in censored survival data
+
+We have data on every candidate $(X_i'\beta, T_i, Y_i)$ where $T_i$ is the time we observed the candidate and $Y_i \in (0,1)$ represents whether they were alive or dead at last follow-up. Note patients who are transplanted are censored at the time of transplant, something which obviously happens at a higher rate to higher LAS candidates. 
+
+Let $X_i'\beta_{WL} = \eta_i$ be the linear prediction from the LAS waitlist model. Discrimination can be defined here the probability of having a higher risk score if you died sooner, or:
+
+$$P(  X_i'\beta > X_j'\beta | T_i < T_j)$$
+
+Note that this is analogous to $P(TestPositive|DiseasePositive)$, the sensitivity.
+
+Harrel estimates this probability by classifying all pairs of observations with observed failure times ($Y_i = 1$) in the dataset as 
+
+1. **Concordant** if $X_i'\beta > X_j'\beta$ and $T_i < T_j$ or $X_i'\beta < X_j'\beta$ and $T_i > T_j$
+2. **Discordant** otherwise
+
+
+$$c = \frac{concordant}{concordant + discordant}$$
+
+If we had complete follow-up on every patient ($Y_i = 1$ for all $i$), then harrell's c index would be equivalent to the concordance probability. However if we have censoring, the harrel's c diverges from this quantity. For patients with $Y_i = 0$, we haven't actually observed their "true" survival time $T$. Harrel deals with censoring in the following way
+
+1. If $Y_i = 0$ and $Y_j = 0$, we have not observed an outcome for either patient and we throw this pair out
+2. If $Y_i = 1$ and $Y_j = 0$, we include this pair if $T_i < T_j$, because we know patient $i$ survived at least as long as patient $j$. Otherwise, this pair is not thrown out.
+
+As the censoring fraction goes up, harrell's c-index tends to be biased upwards. In the case of the waitlist model, we have heavy censoring from transplant that is informative (higher $X_i'\beta$ transplanted at faster rate). Therefore we need another way to estimate $P( T_i < T_j | X_i'\beta > X_j'\beta )$ in the setting of watilist candidates
+
+## Concordance probability estimate
+
+Gonen and Heller (Biometrika 2005) define a different way to estimate the concordance probability in the context of a proportional hazards model that does not dependent on an assumption of non-informative censoring. It relies on the fact that for a given values of $X_i$ and $X_j$ **if proportional hazards** hold then the probability that $T_i$ is greater than $T_j$ is: 
+
+$$P( T_i > T_j | X_i, X_j) = \frac{1}{1 + exp\{(X_i - X_j)' \beta \}}$$
+
+This logistic expression can be derived from the proporitonal hazards assumption, specifically that $P(T_i > t) = S(t) = S_0(t)^{x_i'\beta}$. 
+```{r, echo=FALSE, warning = FALSE}
+example_data <- tibble(x_ij = seq(-5, 5, 0.1),
+                       beta = 0)
+  
+for (b in seq(1, 10, 1)) {
+  example_data <- example_data %>% 
+    rbind(tibble(x_ij = seq(-5, 5, 0.1),
+         beta = b)
+  )
+}
+
+example_data %>% 
+  mutate(Xbeta = x_ij*beta,
+           prob = 1/(1 + exp(Xbeta))) %>%
+  ggplot(aes(x = Xbeta, y = prob)) +
+  geom_point() + lims(x = c(-5, 5)) + labs(x = "Beta*(X1 - X2)", y = "P(T1 > T2)")
+  # ggplot(aes(x = x_ij, y = prob,color = factor(beta))) +
+  # geom_line() + labs(x = "X_i - X_j", color = "beta", y = "P(T_i > T_j)")
+```
+As the linear predictor of the risk of $X_i'\beta$ gets much larger than $X_j'\beta$, the probability that the survival time of individual $i$ being larger than individual $j$ goes to zero. Conversely, when $X_j'\beta$ gets much larger than $X_i'\beta$, the probability that individual $i$ survives longer than indiviudal $j$ goes to 1.
+
+
+Here is this logistic function over a range of $beta$ values. A more discriminatory model will have a steeper curve- the probability $P(T_i> T_j)$ will jump quickly from 1 to 0 when passing over $X_i - X_j = 0$
+```{r, echo=FALSE}
+example_data %>% 
+  mutate(Xbeta = x_ij*beta,
+           prob = 1/(1 + exp(Xbeta))) %>%
+  # ggplot(aes(x = Xbeta, y = prob)) +
+  # geom_point() + lims(x = c(-5, 5)) + labs(x = "Beta*(X1 - X2)", y = "P(T1 > T2)")
+  ggplot(aes(x = x_ij, y = prob,color = factor(beta))) +
+  geom_line() + labs(x = bquote(X[i] - X[j]), color = expression(beta), y = bquote(P(T[i] > T[j])))
+```
+
+
+With this analytic relationship in hand, the cocondrance probability can be estimated from the sample
+
+$$P( T_i < T_j | X_i'\beta > X_j'\beta )$$
+
+This is the **concordance probability**, which is the probability of dying sooner if you have higher predicted model risk. Note this is  not the same thing as $P(  X_i'\beta > X_j'\beta | T_i < T_j)$, or the probability of having a higher predicted model risk if you die sooner. Rather, the CPE is analagous to the postive predictive value $P(diseasePostive|TestPostive$.
+
+
+The CPE is estimated from the data with the following formula: 
+$$ K(\hat{\beta}_{WL}) = \frac{2}{n*(n-1)} \sum_i \sum_j \frac{I\{ X_j'\beta -  X_i'\beta < 0\}}{1 + exp(X_j'\beta - X_i'\beta)} + \frac{I\{ X_i'\beta -  X_j'\beta < 0\}}{1 + exp(X_i'\beta - X_j'\beta)}\ $$
+
+This statistic nears 1 when pairs have large differences in $X_i'\beta -  X_j'\beta$ on average, i.e. that the risk scores are "spread out" and more discriminatory. 
+
+This concordance probability estimate (CPE) is equivalent to harrel's c-statisitc in the absence of censoring. It's important to note that this formula only relies on the partial likelihood estimate of $\hat{\beta}$ after fitting the cox model and the distribution of the covariates $X$ in the data. 
+
+It can 1) be applied in a out of sample test cohort and 2) It has been applied in the context [heart transplant candidates](https://journals.lww.com/transplantjournal/Fulltext/2017/09000/Prediction_of_Waitlist_Mortality_in_Adult_Heart.42.aspx).
+
+
+# Candidates
+
+## Discrimination
+### CPE estimate
+```{r}
+#install.packages("CPE")
+
+#generate a coxfit object and insert the linear predictions
+coxfit_cans <- coxph(Surv(time, death1yr) ~ wait_xb, data = candidates)
+
+cpe_cans <- CPE::phcpe(coxfit_cans, CPE.SE=TRUE)
+
+cpe_cans
+```
+The wait-list model ranked candidates in the correct risk order `r round(100*cpe_cans$CPE)`% of the time (95% CI `r round(100*(cpe_cans$CPE -1.96*cpe_cans$CPE.SE))` - `r round(100*(cpe_cans$CPE +1.96*cpe_cans$CPE.SE))`%)
+
+
+### Harrel's c
+```{r}
+harrels_c_wait <- survConcordance(Surv(time, death1yr) ~ wait_xb, data = candidates)
+
+harrels_c_wait$concordance
+```
+Harrel's c is biased significantly upwards for candidates.
+
+
+### Uno C
+```{r }
+UnoC(Surv(candidates$time, candidates$death1yr), Surv(candidates$time, candidates$death1yr), candidates$wait_xb, time = 363)
+```
+Uno's C, which is an estimate of $P(  X_i'\beta > X_j'\beta | T_i < T_j)$ accounts for the censoring distribution, yields a significant lower c-statistic than Harel's
+
+
+## WL model calibration
+```{r}
+observed_RMST <- function(data, xb, num_groups =1){
+
+  if (num_groups ==1){
+    for_calib <- data
+          
+    
+     KM_model <- summary(survfit(Surv(time, death1yr) ~ 1, data = for_calib))
+     
+     output <- tibble(time = KM_model$time,
+             survival = KM_model$surv) %>%
+       mutate(tile = 1,
+               time = ifelse(row_number() == n() & time != 365, 365, time),
+                time_diff = ifelse(row_number() ==1,time, time - lag(time)),
+               days = survival*time_diff,
+              observed_RMST = sum(days)) %>%
+        select(tile, observed_RMST) %>%
+        filter(row_number() ==1) 
+     
+     output$observed_RMST
+
+  } else{
+
+    for_calib <- data %>%
+  mutate(tile = ntile({{xb}},num_groups))
+    
+    KM_model <- summary(survfit(Surv(time, death1yr) ~ tile, data = for_calib))
+    
+     output <- tibble(time = KM_model$time,
+             survival = KM_model$surv, 
+             tile = KM_model$strata) %>%
+        group_by(tile) %>%
+        mutate(time = ifelse(row_number() == n() & time != 365, 365, time),
+                time_diff = ifelse(row_number() ==1,time, time - lag(time)),
+               days = survival*time_diff,
+              observed_RMST = sum(days)) %>%
+        select(tile, observed_RMST) %>%
+        filter(row_number() ==1) %>%
+        ungroup() 
+      
+      return(output$observed_RMST)
+  }
+  
+  
+}
+```
+
+```{r}
+ mean_WL_calib <- map(can_sample_list, observed_RMST, xb = wait_xb)
+ mean_PT_calib <- map(recip_sample_list, observed_RMST, xb = post_xb)
+ 
+ 
+ 
+ 
+ decile_WL <- map(can_sample_list, observed_RMST, num_groups = 10, xb = wait_xb)
+ decile_PT <- map(recip_sample_list, observed_RMST, num_groups = 10, xb = post_xb)
+ 
+
+
+
+samples_to_df <- function(samples){
+  df <- as.data.frame(samples)
+  
+  colnames(df) <- map(seq(1:ncol(df)), function(x) paste0("sample_", x))
+  
+  df
+}
+
+
+```
+
+
+### WL Calibration error for entire candidates
+```{r}
+se_mean_WL <- sd(tidyr::pivot_longer(samples_to_df(mean_WL_calib),
+               everything(), names_prefix = "sample_")$value)
+
+
+
+mean_WL_calib_summary <- candidates %>%
+  summarise(predicted_WL = mean(WL)) %>%
+  cbind(observed_WL = observed_RMST(candidates, xb = wait_xb, 1)) %>%
+  mutate(se_mean_observed = se_mean_WL,
+         up_ci_observed = observed_WL + 1.96*se_mean_observed,
+         low_ci_observed = observed_WL - 1.96*se_mean_observed,
+         calibration_error = observed_WL - predicted_WL,
+         low_ci_error = calibration_error - 1.96*se_mean_observed,
+         up_ci_error = calibration_error + 1.96*se_mean_observed)
+
+
+mean_WL_calib_summary %>% mutate_all(round) %>% select(-se_mean_observed, -up_ci_observed, -low_ci_observed)
+```
+underestimated survival by `r round(mean_WL_calib_summary$calibration_error)` days (95% CI `r round(mean_WL_calib_summary$low_ci_error)`-`r round(mean_WL_calib_summary$up_ci_error)`) on average
+
+
+```{r}
+se_WL_deciles<- samples_to_df(decile_WL) %>%
+  mutate(decile = seq(1:10)) %>%
+  pivot_longer(-decile, names_prefix = "sample_") %>%
+  group_by(decile) %>%
+  summarise(se_WL = sd(value))
+
+
+
+WL_calib_decile_sum <- candidates %>%
+  mutate(decile = ntile(wait_xb, 10)) %>%
+  group_by(decile) %>%
+  summarise(predicted_WL = mean(WL)) %>%
+  cbind(observed_WL = observed_RMST(candidates, xb = wait_xb, num_groups =10)) %>%
+  mutate(calibration_error = observed_WL - predicted_WL) %>%
+  left_join(se_WL_deciles) %>%
+  mutate(
+            low_ci_error = calibration_error - 1.96*se_WL,
+            up_ci_error = calibration_error + 1.96*se_WL)
+```
+
+
+```{r}
+WL_calib_decile_sum %>%
+  select(decile, predicted_WL, observed_WL, calibration_error, low_ci_error, up_ci_error) %>%
+  mutate_all(round)
+```
+
+### WL calibration plot
+```{r}
+WLAUC_Calib <- WL_calib_decile_sum %>%
+  ggplot(aes(x = predicted_WL, y = observed_WL, 
+             ymin =  observed_WL- (calibration_error - low_ci_error), 
+             ymax = observed_WL + (up_ci_error - calibration_error))) +
+  geom_point() + geom_errorbar() + lims(x = c(50, 365), y = c(50,365)) +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(x = "Predicted WLAUC", y = "Observed WLAUC", title = "a) WLAUC Calibration") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+          panel.background = element_blank(), axis.line = element_line(colour = "black"),
+          legend.key=element_blank(),
+          legend.position="bottom")
+
+WLAUC_Calib <- as.ggplot(WLAUC_Calib)
+
+```
+
+### Code to calculate predicted KM curves + 95% CI
+```{r}
+predicted_surv_function <- function(data,xb, decile,baseline_surv){
+  
+  xbeta_decile <- data %>%
+    mutate(d = ntile({{xb}}, 10)) %>%
+    group_by(d) %>%
+    summarise(mean_xbeta  = mean({{xb}})) %>%
+    filter(d == decile)
+  
+  xb_decile <- xbeta_decile$mean_xbeta
+  
+  df <- baseline_surv %>%
+    filter(time != 0) %>%
+    mutate(survival = Survival^(exp(xb_decile)),
+           group = "Predicted") %>%
+    select(-Survival) %>%
+    filter(time != 364)
+  
+  df$survival 
+}
+```
+
+#### Run on bootstrapped samples
+```{r, message = FALSE, error = FALSE}
+ predicted_1st_candidates <- map(can_sample_list,
+                                 predicted_surv_function,
+                                 xb = wait_xb,
+                                 decile =1,
+                                 baseline_surv = wait_surv)
+ 
+ predicted_10th_candidates <- map(can_sample_list,
+                                  predicted_surv_function,
+                                  xb = wait_xb,
+                                  decile =10,
+                                  baseline_surv = wait_surv)
+ 
+ 
+ predicted_1st_recips <- map(recip_sample_list,
+                             predicted_surv_function,
+                             xb = post_xb,
+                             decile =1,
+                             baseline_surv = post_surv)
+ 
+ predicted_10th_recips <- map(recip_sample_list,
+                              predicted_surv_function,
+                              xb = post_xb,
+                              decile =10,
+                              baseline_surv = post_surv)
+ 
+
+```
+
+#### function to calculate mean predicted survival function and 95% CI from bootstrapped samples
+```{r}
+pred_km_wCI <- function(df){
+  df %>%
+    as.data.frame.list() %>%
+    cbind(time = seq(1, 363)) %>%
+    pivot_longer(-time) %>%
+    group_by(time) %>%
+    summarise(survival = mean(value),
+              se_pred = sd(value)) %>%
+    mutate(upper = survival + 1.96*se_pred,
+           lower = survival - 1.96*se_pred) %>%
+    select(-se_pred) %>%
+    mutate(group = "Predicted")
+  
+}
+```
+
+
+#### Compute observed KM curve for the decile and return dataframe with 95% CI
+```{r}
+observed_surv_function <- function(data,xb, decile,baseline_surv){
+  
+  KM_model <- summary(survfit(Surv(time, death1yr) ~ 1, 
+                              data =  data %>%
+                                mutate(d = ntile({{xb}}, 10)) %>%
+                                filter(d == decile)))
+     
+     observed_surv <- tibble(time = KM_model$time,
+             survival = KM_model$surv,
+             lower = KM_model$lower,
+             upper = KM_model$upper) %>%
+       mutate(group = "Observed") %>%
+       rbind(tibble(
+         time = 365,
+         survival = NA,
+         lower = NA,
+         upper = NA,
+         group = "Observed"
+       ))
+  
+  observed_surv %>%
+    fill(survival, upper, lower) 
+}
+```
+
+
+### Observed versus predicted survival for 1st decile of Candidates
+```{r}
+WL_Survival_1 <- pred_km_wCI(predicted_1st_candidates) %>%
+  rbind(observed_surv_function(candidates, wait_xb, 1, wait_surv)) %>%
+  ggplot(aes(x = time, y= survival, ymin = lower, ymax = upper, linetype = group, fill = group)) +
+  geom_step() + geom_ribbon(alpha = 0.5, show.legend = FALSE) + lims(y = c(0,1))  +
+  labs(x = "Time (days)", y = "Survival (%)", title = "a) Waitlist Survival, 1st Decile") +
+  theme(legend.title=element_blank()) +
+  scale_linetype_manual(values=c("solid", "dotdash")) +
+  scale_fill_manual("",values=c("grey12","grey12")) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+          panel.background = element_blank(), axis.line = element_line(colour = "black"),
+          legend.key=element_blank(),
+          legend.position="bottom")
+
+
+survtimes_WL_1 <- pred_km_wCI(predicted_1st_candidates) %>%
+  rbind(observed_surv_function(candidates, wait_xb, 1, wait_surv))
+
+
+```
+
+
+
+
+### Observed versus predicted survival for 10th decile of Candidates
+```{r}
+WL_Survival_10 <- pred_km_wCI(predicted_10th_candidates) %>%
+  rbind(observed_surv_function(candidates, wait_xb, 10, wait_surv)) %>%
+  ggplot(aes(x = time, y= survival, ymin = lower, ymax = upper, linetype = group, fill = group)) +
+  geom_step() + geom_ribbon(alpha = 0.5, show.legend = FALSE) + lims(y = c(0,1))  +
+  labs(x = "Time (days)", y = "Survival (%)", title = "a) Waitlist Survival, 10th Decile") +
+  theme(legend.title=element_blank()) +
+  scale_linetype_manual(values=c("solid", "dotdash")) +
+  scale_fill_manual("",values=c("grey12","grey12")) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+          panel.background = element_blank(), axis.line = element_line(colour = "black"),
+          legend.key=element_blank(),
+          legend.position="bottom")
+
+
+survtimes_WL_10 <- pred_km_wCI(predicted_10th_candidates) %>%
+  rbind(observed_surv_function(candidates, wait_xb, 10, wait_surv)) %>%arrange(group, time)
+
+
+```
+###Combine WL 1 and WL 10 into single graph
+```{r WL1_10)}
+
+combined_figure_WLAUC <- combined_plot2(WL_Survival_1,WL_Survival_10,  "")
+
+
+
+```
+
+
+# Recipients
+
+## Discrimination
+
+### CPE
+```{r}
+coxfit_recips <- coxph(Surv(time, death1yr) ~ post_xb, data = recips)
+
+cpe_recips <- CPE::phcpe(coxfit_recips, CPE.SE=TRUE)
+
+cpe_recips
+```
+The post-transplant model ranked recipients in the correct risk order `r round(100*cpe_recips$CPE)`% of the time (95% CI `r round(100*(cpe_recips$CPE -1.96*cpe_recips$CPE.SE))` - `r round(100*(cpe_recips$CPE +1.96*cpe_recips$CPE.SE))`%)
+
+
+### Harrel's c
+```{r }
+harrels_c_post <- survConcordance(Surv(time, death1yr) ~ post_xb, data = recips)
+
+harrels_c_post$concordance
+```
+
+### Uno C
+```{r }
+UnoC(Surv(recips$time, recips$death1yr), Surv(recips$time, recips$death1yr), recips$post_xb, time = 363)
+```
+The recipient CPE, Uno's c and harrel's c values are very similar, this is because there is very little censoring on the recipient side
+
+
+## PT Model calibration
+```{r}
+se_mean_PT <- sd(pivot_longer(samples_to_df(mean_PT_calib),
+               everything(), names_prefix = "sample_")$value)
+
+recips %>%
+  summarise(predicted_PT = mean(PT)) %>%
+  cbind(observed_PT = observed_RMST(recips, xb = post_xb, 1)) %>%
+  mutate(se_mean_observed = se_mean_PT,
+    calibration_error = round(observed_PT - predicted_PT),
+        low_ci_error = round(calibration_error - 1.96*se_mean_observed),
+         up_ci_error = round(calibration_error + 1.96*se_mean_observed)) %>%
+  mutate_all(round) %>% select(-se_mean_observed)
+```
+
+
+
+```{r}
+se_PT_deciles<- samples_to_df(decile_PT) %>%
+  mutate(decile = seq(1:10)) %>%
+  pivot_longer(-decile, names_prefix = "sample_") %>%
+  group_by(decile) %>%
+  summarise(se_PT = sd(value))
+
+
+PT_calib_deciles_sum <- recips %>%
+  mutate(decile = ntile(post_xb, 10)) %>%
+  group_by(decile) %>%
+  summarise(predicted_PT = mean(PT)) %>%
+  cbind(observed_PT = observed_RMST(recips,xb = post_xb, 10)) %>%
+  mutate(calibration_error = observed_PT - predicted_PT) %>%
+  left_join(se_PT_deciles) %>%
+  mutate(
+            low_ci_error= calibration_error - 1.96*se_PT,
+            up_ci_error = calibration_error + 1.96*se_PT)
+```
+
+
+```{r}
+PT_calib_deciles_sum %>%
+  mutate_all(round)
+```
+
+
+
+### PT calibration plot
+```{r}
+PTAUC_Calib <- PT_calib_deciles_sum %>%
+  ggplot(aes(x = predicted_PT, y = observed_PT, 
+             ymin =  observed_PT- (calibration_error - low_ci_error), 
+             ymax = observed_PT + (up_ci_error - calibration_error))) +
+  geom_point() + geom_errorbar() + lims(x = c(250, 365), y = c(250,365)) +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+    labs(x = "Predicted PTAUC", y = "Observed PTAUC", title = "a) PTAUC Calibration") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+          panel.background = element_blank(), axis.line = element_line(colour = "black"),
+          legend.key=element_blank(),
+          legend.position="bottom")
+
+
+PTAUC_Calib <- as.ggplot(PTAUC_Calib)
+```
+
+### Observed versus predicted survival for 1st decile of recipients
+```{r}
+
+
+PT_Survival_1 <- pred_km_wCI(predicted_1st_recips) %>%
+  rbind(observed_surv_function(recips, post_xb, 1, post_surv)) %>%
+  ggplot(aes(x = time, y= survival, ymin = lower, ymax = upper, linetype = group, fill = group)) +
+  geom_step() + geom_ribbon(alpha = 0.5 , show.legend = FALSE) + lims(y = c(0,1))  +
+  labs(x = "Time (days)", y = "Survival (%)", title = "a) Post-transplant Survival, 1st Decile") +
+  theme(legend.title=element_blank()) +
+  scale_linetype_manual(values=c("solid", "dotdash")) +
+  scale_fill_manual("",values=c("grey12","grey12")) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+          panel.background = element_blank(), axis.line = element_line(colour = "black"),
+          legend.key=element_blank(),
+          legend.position="bottom")
+
+
+survtimes_PT_1 <- pred_km_wCI(predicted_1st_recips) %>%
+  rbind(observed_surv_function(recips, post_xb, 1, post_surv)) %>%arrange(group, time)
+
+```
+
+
+### Observed versus predicted survival for 10th decile of recipients
+```{r}
+
+PT_Survival_10 <-pred_km_wCI(predicted_10th_recips) %>%
+  rbind(observed_surv_function(recips, post_xb, 10, post_surv)) %>%
+  ggplot(aes(x = time, y= survival, ymin = lower, ymax = upper, linetype = group, fill = group)) +
+  geom_step() + geom_ribbon(alpha = 0.5, show.legend = FALSE) + lims(y = c(0,1)) +
+  labs(x = "Time (days)", y = "Survival (%)", title = "a) Post-transplant Survival, 10th Decile") +
+  theme(legend.title=element_blank()) +
+  scale_linetype_manual(values=c("solid", "dotdash")) +
+  scale_fill_manual("",values=c("grey12","grey12")) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+          panel.background = element_blank(), axis.line = element_line(colour = "black"),
+          legend.key=element_blank(),
+          legend.position="bottom")
+
+
+survtimes_PT_10 <- pred_km_wCI(predicted_10th_recips) %>%
+  rbind(observed_surv_function(recips, post_xb, 10, post_surv))  %>%arrange(group, time)
+
+
+```
+
+###Combine PT 1 and WL 10 into single graph
+```{r PT1_10)}
+
+combined_figure_PTAUC <- combined_plot2(PT_Survival_1,PT_Survival_10,  "")
+
+
+```
+
+###Combine PT and WL Calibration into single graph
+```{r Combined_Calib)}
+
+combined_figure_calibration <- plot_grid(WLAUC_Calib, PTAUC_Calib, ncol=2)
+
+
+```
+
+
+# Accuracy of LAS
+
+So now we have two reliable estimates for concordance probability for the WL and PT models respectively. However now we need to consider how to evaluate the "rank ordering" of candidates according to LAS
+
+$$LAS = 100*\frac{(PT - 2WL + 730)}{1095}$$
+
+A patient's LAS score is a reflection of two counter-factuals: one where the patient gets a transplant, one where they do not and they remain on the wait-list.
+
+Let $T_{PT,i}$ be the survival time after transplant for patient $i$ and $T_{WL,i}$ be the survival time for patient $i$ on the waitlist (without transplant). In terms of the the concordance probability, we get a more complex expression.
+
+$$P(T_{PT,i} - 2T_{WL,i} > T_{PT,j} - 2T_{WL,j} \space | \space LAS_i > LAS_j)$$
+
+Immediate challenges are:
+
+* The clean analytic expression derived in the CPE doesn't obviously hold as our outcome variable is a linear combination of survival times
+* Given the functional form of LAS seems like we cannot avoid calculating the predicted RMST values here using the baseline survival
+* we have the same issues with heavy censoring $T_{WL,i}$ as before so we can't construct some sort of modified Harrel's c.
+* we only observe one counterfactual per patient so only observe $T_{WL,i}$ or $T_{PT,i}$
+
+
+```{r}
+observed_LAS <- function(r_data, c_data, quantiles = LAS_quantiles){
+  
+    LAS_quantiles <- quantiles
+    
+    LAS_quantiles[[1]] <- 0 
+    
+    LAS_quantiles[[101]] <- 100
+    
+    
+    for_recip_KM <- r_data %>%
+      mutate(
+             LAS_quant = cut(LAS, LAS_quantiles)
+      )
+    
+    KM_PT_LAS_PCT <- summary(survfit(Surv(time, death1yr) ~ LAS_quant, for_recip_KM))
+    
+    observed_PT_by_LAS_range <- tibble(time = KM_PT_LAS_PCT$time,
+           survival = KM_PT_LAS_PCT$surv, 
+           LAS_range = KM_PT_LAS_PCT$strata) %>%
+      group_by(LAS_range) %>%
+      mutate(time = ifelse(row_number() == n() & time != 365, 365, time),
+              time_diff = ifelse(row_number() ==1,time, time - lag(time)),
+             days = survival*time_diff,
+             PT = sum(days)) %>%
+      select(LAS_range, PT) %>%
+      filter(row_number() ==1) %>%
+      ungroup() 
+    
+    if (nrow(observed_PT_by_LAS_range) != 100) {
+      return(rep(NA, 100))
+    } 
+    
+    for_cand_KM <- c_data %>%
+          mutate(LAS_quant = cut(LAS, LAS_quantiles)
+          )
+
+ 
+  KM_WL_LAS_PCT <- summary(survfit(Surv(time, death1yr) ~ LAS_quant, for_cand_KM))
+  
+  observed_WL_by_LAS_range <- tibble(time = KM_WL_LAS_PCT$time,
+         survival = KM_WL_LAS_PCT$surv, 
+         LAS_range = KM_WL_LAS_PCT$strata) %>%
+    group_by(LAS_range) %>%
+    mutate(time = ifelse(row_number() == n() & time != 365, 365, time),
+            time_diff = ifelse(row_number() ==1,time, time - lag(time)),
+           days = survival*time_diff,
+           WL = sum(days),
+           num_obs= n()) %>%
+    select(LAS_range, WL) %>%
+    filter(row_number() ==1) %>%
+    ungroup()
+  
+  LAS_calib <- observed_PT_by_LAS_range %>%
+    left_join(observed_WL_by_LAS_range) %>%
+    mutate(WL = if_else(is.na(WL), 365, WL),
+           observed_LAS = LAS(PT, WL),
+           survival_benefit = PT - WL)
+  
+  
+  if (length(LAS_calib$observed_LAS) == 100) {
+    return(LAS_calib$observed_LAS)
+  } else {
+    return(rep(NA, 100))
+  }
+  
+}
+
+```
+
+```{r, warning=FALSE, message=FALSE}
+
+LAS_quantiles <- quantile(recips$LAS, probs = seq(0, 1, 0.01))
+
+LAS_quantiles[[1]] <- 0 
+
+LAS_quantiles[[101]] <- 100
+
+observed_LAS_samples <- map2(recip_sample_list, can_sample_list, observed_LAS)
+
+```
+
+
+```{r}
+output <- as.data.frame.list(observed_LAS_samples)
+
+output <- output[, colSums(is.na(output)) == 0]
+
+colnames(output) <- map(seq(1:ncol(output)), function(x) paste0("sample_", x))
+
+LAS_ranges <- recips %>% 
+  mutate(LAS_range = cut(LAS, LAS_quantiles)) %>%
+  arrange(LAS) %>% 
+  group_by(LAS_range) %>%
+  summarise(average_LAS = mean(LAS))
+
+output <- output %>%
+  cbind(LAS_range = LAS_ranges$LAS_range) %>%
+  select(LAS_range, everything())
+
+LAS_calib <- output %>%
+  pivot_longer(cols = -LAS_range, names_prefix = "sample_", names_to ="sample") %>%
+  group_by(LAS_range) %>%
+  summarise(mean_observed_LAS = mean(value, na.rm = TRUE),
+            se_observed_LAS = sd(value, na.rm = TRUE),
+            median_observed_LAS = median(value, na.rm = TRUE),
+            pct_25 = quantile(value, probs = 0.25)[[1]],
+            pct_75 = quantile(value, probs = 0.75)[[1]]) %>%
+  cbind(average_LAS = LAS_ranges$average_LAS) %>% 
+  mutate(low_ci = mean_observed_LAS - 1.96*se_observed_LAS,
+         up_ci = mean_observed_LAS + 1.96*se_observed_LAS,
+         low_ci = ifelse(low_ci < 25, 25, low_ci),
+         up_ci = ifelse(up_ci > 100, 100, up_ci)) 
+
+
+
+average_calibration_error <- mean(LAS_calib$mean_observed_LAS - LAS_calib$average_LAS)
+
+se_avg_calib_error <- sd(LAS_calib$mean_observed_LAS - LAS_calib$average_LAS)
+
+
+# calculate 
+for_lm <- output %>%
+  cbind(predicted_LAS = LAS_ranges$average_LAS) %>%
+  select(-LAS_range) %>% 
+  pivot_longer(cols = -predicted_LAS, names_prefix = "sample_", names_to ="sample")
+
+r_squared <- summary(lm(for_lm$value ~ for_lm$predicted_LAS))$r.squared 
+
+#lm_model <- summary(lm(mean_observed_LAS ~ average_LAS, data = LAS_calib))
+#r_squared <- lm_model$r.squared  
+
+LAS_calib %>%
+  ggplot(aes(x = average_LAS, y = mean_observed_LAS, ymin = low_ci, ymax = up_ci)) +
+  #ggplot(aes(x = average_LAS, y = median_observed_LAS, ymin = pct_25, ymax = pct_75)) +
+  geom_point() + 
+  geom_errorbar(alpha = 0.5) +
+  lims(x = c(25,100), y = c(25,100)) +
+  geom_abline(aes(intercept = 0, slope = 1, color = "Perfect Calibration")) +
+  annotate("text", x = 40, y = 90, label = paste("italic(R) ^ 2 == ", round(r_squared, 2)),parse = TRUE) +
+  labs(x = "Predicted LAS", y = "Observed LAS", title = "") +
+  theme(legend.title=element_blank()) +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), 
+          panel.background = element_blank(), axis.line = element_line(colour = "black"),
+          legend.key=element_blank(),
+          legend.position="bottom")
+
+ggsave("./Graphs/LAS_Calibration_s1000.jpg")
+
+
+```
+The mean is average observed LAS for each percentile and the 95% CI are dervied with the bootstrap samples and represent the uncertainty in the mean value of the observed LAS for each percentile of average LAS. The R^2 is from the entire sample so accounts for the uncertainty in observed LAS at higher predicted LAS values. 
+
+## Box plot of all 10K samples
+```{r}
+for_lm %>%
+  ggplot(aes(x = predicted_LAS, y = value, group = predicted_LAS)) +
+  geom_boxplot(outlier.shape = NA) +   labs(x = "LAS", y = "observed LAS") +
+  lims(x = c(25,100), y = c(25,100))
+```
+
+
+
+
